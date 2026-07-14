@@ -3,7 +3,7 @@
 ;; Copyright (C) 2024  Free Software Foundation, Inc.
 
 ;; Author: Paul D. Nelson <nelson.paul.david@gmail.com>
-;; Version: 0.2
+;; Version: 0.3
 ;; URL: https://github.com/ultronozm/auctex-label-numbers.el
 ;; Package-Requires: ((emacs "27.1") (auctex "14.0.5"))
 ;; Keywords: tex
@@ -77,9 +77,6 @@ cannot be retrieved."
   :type '(choice (const :tag "Default" nil)
                  (function :tag "Custom function")))
 
-;; FIXME: we don't properly handle the optional arguments to
-;; \externaldocument, i.e., prefixes for labels.
-
 (defun auctex-label-numbers-label-to-number-helper (label aux-file)
   "Get the number of LABEL from the AUX-FILE.
 Check the cache first, and update it if AUX-FILE has changed.  Return
@@ -107,45 +104,109 @@ to find the corresponding aux files."
                  (const :tag "Don't search external documents" nil)))
 
 (defconst auctex-label-numbers--external-document-regexp
-  "\\\\external\\(?:cite\\)?document\\(?:\\[\\([^]]+\\)\\]\\)?{\\([^}]+\\)}"
+  "\\\\external\\(?:cite\\)?document\\(?:\\[\\([^]]*\\)\\]\\)?\\(?:\\[nocite\\]\\)?{\\([^}]+\\)}"
   "Regexp for \\externaldocument commands.
 Optional prefix is (match-string 1), filename is (match-string 2).")
+
+(defun auctex-label-numbers--ordinal-letters (ordinal)
+  "Return spreadsheet-style letters for ORDINAL: 1=A, ..., 26=Z, 27=AA."
+  (let ((result ""))
+    (while (> ordinal 0)
+      (setq ordinal (1- ordinal))
+      (setq result (concat (char-to-string (+ ?A (% ordinal 26))) result))
+      (setq ordinal (/ ordinal 26)))
+    result))
+
+(defun auctex-label-numbers-external-prefix-letter (ordinal _prefix _filename)
+  "Return letters A, B, ..., Z, AA, ... according to ORDINAL."
+  (auctex-label-numbers--ordinal-letters ordinal))
+
+(defun auctex-label-numbers-external-prefix-x (_ordinal _prefix _filename)
+  "Return the constant display prefix \"X\"."
+  "X")
+
+(defcustom auctex-label-numbers-external-prefix-function
+  #'auctex-label-numbers-external-prefix-letter
+  "Function computing the display prefix for external label numbers.
+Called with three arguments describing the \\externaldocument
+declaration through which a label was resolved: ORDINAL, the 1-based
+position of the declaration among those in the current document; PREFIX,
+the label prefix from the declaration's optional argument, or nil if
+there is none; and FILENAME, the declared file name.  The returned
+string is prepended to the label number in the folded display."
+  :type '(choice
+          (function-item :tag "Letters by declaration order (A, B, ...)"
+                         auctex-label-numbers-external-prefix-letter)
+          (function-item :tag "Constant \"X\""
+                         auctex-label-numbers-external-prefix-x)
+          (function :tag "Custom function")))
+
+(defun auctex-label-numbers--external-documents ()
+  "Return the \\externaldocument declarations of the current buffer.
+The result is a list of (ORDINAL PREFIX FILENAME) lists, in buffer
+order, where ORDINAL counts declarations starting from 1 and PREFIX is
+nil for unprefixed declarations."
+  (save-excursion
+    (save-restriction
+      (widen)
+      (goto-char (point-min))
+      (let ((ordinal 0)
+            declarations)
+        (while (re-search-forward
+                auctex-label-numbers--external-document-regexp nil t)
+          (setq ordinal (1+ ordinal))
+          (push (list ordinal (match-string 1) (match-string 2))
+                declarations))
+        (nreverse declarations)))))
 
 (defun auctex-label-numbers-label-to-number (label)
   "Get number of LABEL for current tex buffer.
 If the buffer does not point to a file, or if the corresponding aux file
 does not exist, or if the label cannot be found, then return nil.
 Otherwise, return the label number as a string.  If the label is found
-in an external document, prefix the string with \"X\"."
+in an external document, prefix the string using
+`auctex-label-numbers-external-prefix-function'."
   (if auctex-label-numbers-label-to-number-function
       (funcall auctex-label-numbers-label-to-number-function label)
     (or
      ;; Check main aux file
      (when-let* ((aux-file (TeX-master-output-file "aux")))
        (auctex-label-numbers-label-to-number-helper label aux-file))
-     ;; Search external documents
+     ;; Search external documents.  xr imports label FOO from the
+     ;; external document as PREFIXFOO, so a prefixed \externaldocument
+     ;; can only define labels starting with PREFIX, and the external
+     ;; aux file must be consulted with the prefix stripped.  When
+     ;; several declarations define the same label, the last one wins,
+     ;; because that is the order in which xr reads the aux files; we
+     ;; therefore probe the declarations in reverse.
      (and
       auctex-label-numbers-search-external-documents
-      (save-excursion
-        (save-restriction
-          (widen)
-          (goto-char (point-min))
-          (let (found)
-            (while (and (null found)
-                        (re-search-forward auctex-label-numbers--external-document-regexp
-                                           nil t))
-              (let* ((prefix (match-string 1))
-                     (tex-filename (concat (match-string 2) ".tex"))
+      (let ((declarations (reverse (auctex-label-numbers--external-documents)))
+            found)
+        (while (and (null found) declarations)
+          (let* ((declaration (pop declarations))
+                 (ordinal (nth 0 declaration))
+                 (prefix (nth 1 declaration))
+                 (external (nth 2 declaration)))
+            (when (or (null prefix) (string-prefix-p prefix label))
+              (let* ((tex-filename (concat external ".tex"))
                      (tex-buffer (find-file-noselect tex-filename))
                      (aux-filename
                       (with-current-buffer tex-buffer
                         (hack-local-variables)
-                        (TeX-master-output-file "aux"))))
-                (when aux-filename
-                  (let ((full-label (concat (or prefix "") label)))
-                    (setq found (auctex-label-numbers-label-to-number-helper full-label aux-filename))))))
-            (when found
-              (concat "X" found)))))))))
+                        (TeX-master-output-file "aux")))
+                     (bare-label (if prefix
+                                     (substring label (length prefix))
+                                   label)))
+                (when-let* ((_ aux-filename)
+                            (number (auctex-label-numbers-label-to-number-helper
+                                     bare-label aux-filename)))
+                  (setq found
+                        (concat
+                         (funcall auctex-label-numbers-external-prefix-function
+                                  ordinal prefix external)
+                         number)))))))
+        found)))))
 
 (defun auctex-label-numbers-preview-preprocessor (str)
   "Preprocess STR for preview by adding tags to labels.
@@ -195,6 +256,18 @@ label number cannot be retrieved."
 (defvar auctex-label-numbers--saved-spec-list nil
   "Saved values from `TeX-fold-macro-spec-list'.")
 
+(defun auctex-label-numbers--fold-spec-display (spec)
+  "Return the display component of folding SPEC.
+SPEC may be an unsigned display such as `TeX-fold-cite-display', or a
+signed display such as (\"[l]\" . TeX-fold-stop-after-first-mandatory)."
+  (if (consp spec) (car spec) spec))
+
+(defun auctex-label-numbers--fold-spec-with-display (spec display)
+  "Return folding SPEC with its display component replaced by DISPLAY.
+For example, replacing `TeX-fold-cite-display' returns DISPLAY, while
+replacing (\"[r]\" . 1) returns (DISPLAY . 1), preserving the signature."
+  (if (consp spec) (cons display (cdr spec)) display))
+
 (defcustom auctex-label-numbers-macro-list '("ref" "eqref" "label")
   "List of macros to fold with theorem or equation numbers.
 Each element describes a LaTeX macro that takes a label as its argument.
@@ -238,14 +311,25 @@ Call ORIG-FUN with ARGS, and add the label number to the annotation."
     (advice-add 'reftex-goto-label :around #'auctex-label-numbers--reftex-goto-label-advice)
     (require 'tex-fold)
     (dolist (macro auctex-label-numbers-macro-list)
-      (let ((func (intern (format "auctex-label-numbers-%s-display" macro))))
-        (dolist (spec TeX-fold-macro-spec-list)
-          (when (and (member macro (cadr spec))
-                     (not (eq (car spec) func)))
-            (push (cons macro (car spec)) auctex-label-numbers--saved-spec-list)
-            (setcdr spec (list
-                          (seq-remove (lambda (x) (equal x macro)) (cadr spec))))))
-        (add-to-list 'TeX-fold-macro-spec-list (list func (list macro)))))
+      (let* ((func (intern (format "auctex-label-numbers-%s-display" macro)))
+             (entry
+              (seq-find
+               (lambda (entry)
+                 (and (member macro (cadr entry))
+                      (not (eq (auctex-label-numbers--fold-spec-display
+                                (car entry))
+                               func))))
+               TeX-fold-macro-spec-list))
+             (old-spec (and entry (car entry)))
+             (replacement-spec
+              (and old-spec
+                   (auctex-label-numbers--fold-spec-with-display
+                    old-spec func))))
+        (when entry
+          (push (cons macro old-spec) auctex-label-numbers--saved-spec-list)
+          (setcdr entry (list (remove macro (cadr entry)))))
+        (add-to-list 'TeX-fold-macro-spec-list
+                     (list (or replacement-spec func) (list macro)))))
     (when TeX-fold-mode
       (TeX-fold-mode 1)))
    (t
@@ -257,11 +341,14 @@ Call ORIG-FUN with ARGS, and add the label number to the annotation."
     (dolist (macro auctex-label-numbers-macro-list)
       (let ((func (intern (format "auctex-label-numbers-%s-display" macro))))
         (setq TeX-fold-macro-spec-list
-              (seq-remove (lambda (elem) (eq (car elem) func))
+              (seq-remove (lambda (elem)
+                            (eq (auctex-label-numbers--fold-spec-display
+                                 (car elem))
+                                func))
                           TeX-fold-macro-spec-list)))
       (when-let ((saved (assoc macro auctex-label-numbers--saved-spec-list)))
         (dolist (spec TeX-fold-macro-spec-list)
-          (when (eq (car spec) (cdr saved))
+          (when (equal (car spec) (cdr saved))
             (push macro (cadr spec))))))
     (setq auctex-label-numbers--saved-spec-list nil)
     (when TeX-fold-mode

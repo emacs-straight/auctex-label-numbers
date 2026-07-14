@@ -25,6 +25,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'auctex-label-numbers)
 
 (ert-deftest
     test-auctex-label-numbers--external-document-regexp ()
@@ -60,13 +61,76 @@
   (should (equal (match-string 1 "\\externaldocument[ch1:]{chapter1-file}") "ch1:"))
   (should (equal (match-string 2 "\\externaldocument[ch1:]{chapter1-file}") "chapter1-file"))
 
+  ;; Test the nocite option with an empty prefix
+  (should (string-match auctex-label-numbers--external-document-regexp
+                        "\\externaldocument[][nocite]{nocitefile}"))
+  (should (equal (match-string 1 "\\externaldocument[][nocite]{nocitefile}") ""))
+  (should (equal (match-string 2 "\\externaldocument[][nocite]{nocitefile}") "nocitefile"))
+
   ;; Test that it doesn't match invalid syntax
   (should-not (string-match auctex-label-numbers--external-document-regexp
                             "\\externaldocument{missingbracket"))
   (should-not (string-match auctex-label-numbers--external-document-regexp
-                            "\\externaldocument[]{empty}")) ; Empty optional argument
-  (should-not (string-match auctex-label-numbers--external-document-regexp
                             "\\externaldocument[prefix]nobraces")))
+
+(ert-deftest test-auctex-label-numbers-fold-spec-signatures ()
+  "Preserve AUCTeX signatures while replacing folding displays."
+  (let ((auctex-label-numbers-macro-list '("ref" "eqref" "label"))
+        (auctex-label-numbers--saved-spec-list nil)
+        (TeX-fold-macro-spec-list
+         '((("[l]" . TeX-fold-stop-after-first-mandatory) ("label"))
+           (("[r]" . 1) ("ref" "eqref"))))
+        (preview-preprocess-functions nil)
+        (TeX-fold-mode nil))
+    (unwind-protect
+        (progn
+          (auctex-label-numbers-mode 1)
+          (should
+           (member '((auctex-label-numbers-ref-display . 1) ("ref"))
+                   TeX-fold-macro-spec-list))
+          (should
+           (member '((auctex-label-numbers-eqref-display . 1) ("eqref"))
+                   TeX-fold-macro-spec-list))
+          (should
+           (member
+            '((auctex-label-numbers-label-display
+               . TeX-fold-stop-after-first-mandatory)
+              ("label"))
+            TeX-fold-macro-spec-list)))
+      (auctex-label-numbers-mode -1))
+    (should-not
+     (seq-some
+      (lambda (spec)
+        (memq (if (consp (car spec)) (caar spec) (car spec))
+              '(auctex-label-numbers-ref-display
+                auctex-label-numbers-eqref-display
+                auctex-label-numbers-label-display)))
+      TeX-fold-macro-spec-list))))
+
+(ert-deftest test-auctex-label-numbers--external-documents ()
+  "Test collection of \\externaldocument declarations."
+  (with-temp-buffer
+    (insert "\\externaldocument[A-]{alpha}\n"
+            "\\externaldocument{beta}\n"
+            "\\externalcitedocument[C-]{gamma}\n")
+    (should (equal (auctex-label-numbers--external-documents)
+                   '((1 "A-" "alpha")
+                     (2 nil "beta")
+                     (3 "C-" "gamma"))))))
+
+(ert-deftest test-auctex-label-numbers-external-prefix-letter ()
+  "Test spreadsheet-style external-document prefixes."
+  (dolist (case '((1 "A")
+                  (26 "Z")
+                  (27 "AA")
+                  (52 "AZ")
+                  (53 "BA")
+                  (702 "ZZ")
+                  (703 "AAA")))
+    (pcase-let ((`(,ordinal ,expected) case))
+      (should
+       (equal (auctex-label-numbers-external-prefix-letter ordinal nil nil)
+              expected)))))
 
 (provide 'auctex-label-numbers-tests)
 ;;; auctex-label-numbers-tests.el ends here
